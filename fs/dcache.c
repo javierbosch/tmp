@@ -35,6 +35,8 @@
 #include "internal.h"
 #include "mount.h"
 
+
+//#include "/users/yuvraj/ssd/linux-5.4.62/mm/slab.h"
 #include "../mm/slab.h"
 #include <linux/sort.h>
 #include <linux/delay.h>
@@ -76,6 +78,113 @@
  * If no ancestor relationship:
  * arbitrary, since it's serialized on rename_lock
  */
+
+DECLARE_HASHTABLE(dcache_waittime_hashtable, 5);
+static struct dcache_waittime_tracking default_track_info2;
+
+int track_waittime2 = 0;
+unsigned long long start_track2 = 0;
+
+struct dcache_waittime_tracking {
+	unsigned int uid;	
+	//unsigned long long total_waittime;
+	unsigned long long lock_hold_time[1000];
+	//unsigned long long wait_time[1000];
+	atomic_t cur_index;
+	struct hlist_node hash;
+};
+
+//struct inode_cache_waittime_tracking default_track_info = {.uid = {0}, .total_waittime = {0}, .hash = {NULL}};
+
+struct dcache_waittime_tracking *retrieve_waittime_info2(unsigned int uid)
+{
+	struct dcache_waittime_tracking *waittime_info;
+
+	hash_for_each_possible(dcache_waittime_hashtable, waittime_info, hash, uid) {
+		if (waittime_info->uid == uid) {
+			return waittime_info;
+		}
+	}
+
+	return NULL;
+}
+
+static struct dcache_waittime_tracking *retrieve_or_create_waittime_info2(unsigned int uid)
+{
+	struct dcache_waittime_tracking *waittime_info;
+
+	if (!track_waittime2) {
+		return &default_track_info2;
+	}
+
+    waittime_info = retrieve_waittime_info2(uid);
+
+    if (waittime_info) {
+        return waittime_info;
+    }
+
+    waittime_info = kzalloc(sizeof(struct dcache_waittime_tracking), GFP_KERNEL);
+    if (!waittime_info) {
+        return NULL;
+    }
+
+    waittime_info->uid = uid;
+    INIT_HLIST_NODE(&waittime_info->hash);
+    //waittime_info->total_waittime = 0;
+
+	hash_add(dcache_waittime_hashtable, &waittime_info->hash, uid);
+
+    return waittime_info;
+}
+
+SYSCALL_DEFINE0(wait_time_tracking2)
+{
+	track_waittime2 = !track_waittime2;
+	start_track2 = ktime_get_ns();
+	//if (track_waittime2) {
+	//	cur_index2 = 0;
+	//} else {
+	//	cur_index2 = -1;
+	//}
+
+    printk(KERN_ERR "Changing track_waittime time to %d from %d\n", track_waittime2, !track_waittime2);
+
+	return 0;
+}
+
+SYSCALL_DEFINE0(print_wait_time2)
+{
+	struct dcache_waittime_tracking *waittime_info;
+	int bucket;
+	int i = 0;
+
+	hash_for_each(dcache_waittime_hashtable, bucket, waittime_info, hash) {
+		printk(KERN_ERR "Dcache wait-time User %d\n", waittime_info->uid);
+		for (i = 0; i < 1000; i++) {
+			printk(KERN_ERR "[%d] LHT = %llu\n", i, waittime_info->lock_hold_time[i]);
+		}
+	}
+
+	return 0;
+}
+
+SYSCALL_DEFINE0(clear_wait_time2)
+{
+	struct dcache_waittime_tracking *waittime_info;
+	int bucket;
+
+	hash_for_each(dcache_waittime_hashtable, bucket, waittime_info, hash) {
+		hash_del(&waittime_info->hash);
+		//waittime_info->total_waittime = 0;
+		//printk("Inode cache wait-time User %d, Wait-time %llu\n", waittime_info->uid, waittime_info->total_waittime);
+	}
+
+	return 0;
+}
+
+
+
+
 int sysctl_vfs_cache_pressure __read_mostly = 100;
 EXPORT_SYMBOL_GPL(sysctl_vfs_cache_pressure);
 
@@ -2393,6 +2502,9 @@ struct dentry *__d_lookup(const struct dentry *parent, const struct qstr *name)
 	struct dentry *found = NULL;
 	struct dentry *dentry;
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0;
+	unsigned int index = 0;
+	struct dcache_waittime_tracking *waittime_info;
 
 	/*
 	 * Note: There is significant duplication with __d_lookup_rcu which is
@@ -2419,6 +2531,7 @@ struct dentry *__d_lookup(const struct dentry *parent, const struct qstr *name)
 		ssleep(1);
 	}
 	rcu_read_lock();
+	start = ktime_get_ns();
 	
 	hlist_bl_for_each_entry_rcu(dentry, node, b, d_hash) {
 
@@ -2441,6 +2554,14 @@ struct dentry *__d_lookup(const struct dentry *parent, const struct qstr *name)
 next:
 		spin_unlock(&dentry->d_lock);
  	}
+	end = ktime_get_ns();
+	index = ((end - start_track2) / 1000000000);
+	waittime_info = retrieve_or_create_waittime_info2(uid);
+	if (index > atomic_read(&waittime_info->cur_index) && index < 1000) {
+		waittime_info->lock_hold_time[index] = end - start;
+		atomic_set(&waittime_info->cur_index, index);
+		//printk(KERN_ERR "Dcache [%u] LHT = %llu\n", index, end - start);
+	}
  	rcu_read_unlock();
 
  	return found;
@@ -3235,7 +3356,7 @@ static void __init dcache_init_early(void)
 #define NORMAL_PROBING_MINTIME 5000
 #define NORMAL_PROBING_MAXTIME 20000
 
-#define SPINLOCK_WAITTIME_RANGE 1000 * 1000 * 100 /*100ms*/
+#define SPINLOCK_WAITTIME_RANGE 1000 * 1000 * 100 /*50ms*/
 #define ONE_SECOND 1000 * 1000 * 1000
 
 unsigned int probe_dentry_cache_hash_lock(void)
@@ -3245,21 +3366,37 @@ unsigned int probe_dentry_cache_hash_lock(void)
 	unsigned long long end_sec = 0;
 	unsigned int r;
 	unsigned int aggressive = 0;
+	//unsigned int count = 0;
+	//unsigned long long min = 0xFFFFFFFFFFFFFFFF, max = 0, diff;
 	
 	get_random_bytes(&r, sizeof(r));
+	//curr_time = ktime_get_ns(); //
 	end_sec = ktime_get_ns() + ONE_SECOND + (unsigned long long)r;
+	//printk(KERN_ERR "curr_time = %llu, r = %u, end_sec = %llu, diff = %llu\n", curr_time, r, end_sec, (end_sec - curr_time)/ 1000000000); //
+	//end_sec = ktime_get_ns() + (ONE_SECOND * ((r & 3) + 1));
 
 	while (ktime_get_ns() <= end_sec) {
+		//count++;
 		start = ktime_get_ns();
 		synchronize_rcu();
 		end = ktime_get_ns();
+		/*diff = end - start;
+		if (diff < min) {
+			min = diff;
+		}
+
+		if (diff > max) {
+			max = diff;
+		}*/
 
 		if ((end - start) > SPINLOCK_WAITTIME_RANGE) {
+			//printk(KERN_ERR "RCU Synchronize time %llu ms\n", (end - start)/ 1000000);
 			lock_wait_time_high_count++;
 
 			if (!aggressive) {
 				get_random_bytes(&r, sizeof(r));
 				end_sec = end_sec + (ONE_SECOND * (((unsigned long long)r & 7) + 1));
+				//printk(KERN_ERR "Aggressive mode: End time increasded by %u to %llu, curr_time = %llu, end_sec = %llu\n", ((r & 7) + 1), (end_sec - curr_time)/ 1000000000, curr_time, end_sec); //
 				aggressive = 1;
 			}
 		}
@@ -3274,7 +3411,9 @@ unsigned int probe_dentry_cache_hash_lock(void)
 		}
 	}
 
+	//printk(KERN_ERR "Dcache loops = %u, High = %u, Min time = %llu ns, Max = %llu ns\n", count, lock_wait_time_high_count, min, max);
 	return 0;
+	
 }
 
 unsigned int dcache_get_top_used_hash_bucket(unsigned int *entries)
@@ -3292,6 +3431,8 @@ unsigned int dcache_get_top_used_hash_bucket(unsigned int *entries)
 			index = i;
 		}
 	}
+
+	//printk(KERN_ERR "MAX index = %u, i = %u, max_val = %d, index = %u\n", (1 << (32 - d_hash_shift)), i, max_val, index);
 
 	*entries = max_val;
 
@@ -3345,10 +3486,10 @@ int dentry_cache_memory_analysis(void *arg)
 	struct kmem_cache_memory_tracking *uid_info;
 	int numa_node_id = 0;
 	unsigned long long new_pw_size = 0;
-	//unsigned long long timer_base = 0, timer_end = 0;
-	//unsigned long long sync_start = 0, sync_end = 0;
+	unsigned long long timer_base = 0, timer_end = 0;
+	unsigned long long sync_start = 0, sync_end = 0;
 
-	//timer_base = ktime_get_ns();
+	timer_base = ktime_get_ns();
 
 start:	under_attack = probe_dentry_cache_hash_lock();	
 
@@ -3384,6 +3525,7 @@ start:	under_attack = probe_dentry_cache_hash_lock();
 						uid_info = retrieve_or_create_uid_info_by_nodeid(dentry_cache, values[i].uid, numa_node_id);
 
 						if (slow_down_until <= local_time) {
+							//slow_down_until = local_time + (tracker_pw_sleep_time * 1000000000); 
 							atomic64_set(&uid_info->slow_down_until, local_time + new_pw_size);
 							uid_info->pw_size = new_pw_size;
 						}
@@ -3398,11 +3540,8 @@ start:	under_attack = probe_dentry_cache_hash_lock();
 		}
 	}
 
-	//timer_end = ktime_get_ns();
-	
-	// Just to print data every 10 seconds or so.
-
-	/*if ((timer_end - timer_base) > 10000000000) {
+	timer_end = ktime_get_ns();
+	if ((timer_end - timer_base) > 10000000000) {
 		timer_base = timer_end;
 	
 		values = allocation_cnt_per_uid(dentry_cache);
@@ -3425,11 +3564,11 @@ start:	under_attack = probe_dentry_cache_hash_lock();
 			uid_entries = dcache_walk_single_hash_bucket_for_uid(values[i].uid, bucket_index);
 			printk(KERN_ERR "Timer:dcache_cache: %u user has %u entries out of %u total entries in bucket %u\n", values[i].uid, uid_entries, entries, bucket_index);
 		}
-	}*/
+	}
 
 	goto start;
 
-	kfree(values);
+end:	kfree(values);
 	dentry_cache->memory_tracker_thread = NULL;
 
 	return 0;
@@ -3480,6 +3619,8 @@ static void __init dcache_init(void)
 					NULL,
 					0,
 					0);
+
+	atomic_set(&default_track_info2.cur_index, -1);
 }
 
 /* SLAB cache for __getname() consumers */

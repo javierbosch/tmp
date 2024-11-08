@@ -1042,8 +1042,20 @@ asmlinkage long sys_chown(const char __user *filename,
 				uid_t user, gid_t group);
 asmlinkage long sys_mkdir(const char __user *pathname, umode_t mode);
 asmlinkage long sys_rmdir(const char __user *pathname);
+asmlinkage long sys_change_dcache_hb(int bucket);
+asmlinkage long sys_change_pw(int sleep_time);
+asmlinkage long sys_change_dw(int sleep_time);
+asmlinkage long sys_wait_time_tracking(void);
+asmlinkage long sys_print_wait_time(void);
+asmlinkage long sys_clear_wait_time(void);
 asmlinkage long sys_lchown(const char __user *filename,
 				uid_t user, gid_t group);
+asmlinkage long sys_wait_time_tracking1(void);
+asmlinkage long sys_print_wait_time1(void);
+asmlinkage long sys_clear_wait_time1(void);
+asmlinkage long sys_wait_time_tracking2(void);
+asmlinkage long sys_print_wait_time2(void);
+asmlinkage long sys_clear_wait_time2(void);
 asmlinkage long sys_access(const char __user *filename, int mode);
 asmlinkage long sys_rename(const char __user *oldname,
 				const char __user *newname);

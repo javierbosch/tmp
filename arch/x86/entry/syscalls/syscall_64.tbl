@@ -357,6 +357,18 @@
 433	common	fspick			__x64_sys_fspick
 434	common	pidfd_open		__x64_sys_pidfd_open
 435	common	clone3			__x64_sys_clone3/ptregs
+436	common	change_dw		__x64_sys_change_dw
+438	common	change_pw		__x64_sys_change_pw
+439	common	change_dcache_hb	__x64_sys_change_dcache_hb
+440	common	wait_time_tracking	__x64_sys_wait_time_tracking
+441	common	print_wait_time		__x64_sys_print_wait_time
+442	common	clear_wait_time		__x64_sys_clear_wait_time
+443	common	wait_time_tracking1	__x64_sys_wait_time_tracking1
+444	common	print_wait_time1	__x64_sys_print_wait_time1
+445	common	clear_wait_time1	__x64_sys_clear_wait_time1
+446	common	wait_time_tracking2	__x64_sys_wait_time_tracking2
+447	common	print_wait_time2		__x64_sys_print_wait_time2
+448	common	clear_wait_time2		__x64_sys_clear_wait_time2
 
 #
 # x32-specific system call numbers start at 512 to avoid cache impact

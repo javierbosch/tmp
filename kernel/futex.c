@@ -61,6 +61,7 @@
 
 #include "locking/rtmutex_common.h"
 
+//#include "/users/yuvraj/ssd/linux-5.4.62/mm/slab.h"
 #include "../mm/slab.h"
 #include <linux/timekeeping.h>
 #include <linux/delay.h>
@@ -167,6 +168,110 @@
  * will do the additional required waiter count housekeeping. This is done for
  * double_lock_hb() and double_unlock_hb(), respectively.
  */
+
+DECLARE_HASHTABLE(futex_table_waittime_hashtable, 5);
+static struct futex_table_waittime_tracking default_track_info1;
+
+int track_waittime1 = 0;
+unsigned long long start_track1 = 0;
+
+struct futex_table_waittime_tracking {
+	unsigned int uid;	
+	atomic64_t total_waittime;
+    unsigned long long lock_hold_time[1000];
+    unsigned long long wait_time[1000];
+	unsigned int cur_index;
+	struct hlist_node hash;
+};
+
+static struct futex_table_waittime_tracking *retrieve_waittime_info1(unsigned int uid)
+{
+	struct futex_table_waittime_tracking *waittime_info;
+
+	hash_for_each_possible(futex_table_waittime_hashtable, waittime_info, hash, uid) {
+		if (waittime_info->uid == uid) {
+			return waittime_info;
+		}
+	}
+
+	return NULL;
+}
+
+static struct futex_table_waittime_tracking *retrieve_or_create_waittime_info1(unsigned int uid)
+{
+	struct futex_table_waittime_tracking *waittime_info;
+
+	if (!track_waittime1) {
+		return &default_track_info1;
+	}
+
+    waittime_info = retrieve_waittime_info1(uid);
+
+    if (waittime_info) {
+        return waittime_info;
+    }
+
+    waittime_info = kzalloc(sizeof(struct futex_table_waittime_tracking), GFP_KERNEL);
+    if (!waittime_info) {
+        return NULL;
+    }
+
+    waittime_info->uid = uid;
+    INIT_HLIST_NODE(&waittime_info->hash);
+	atomic64_set(&waittime_info->total_waittime, 0);
+
+	hash_add(futex_table_waittime_hashtable, &waittime_info->hash, uid);
+
+    return waittime_info;
+}
+
+SYSCALL_DEFINE0(wait_time_tracking1)
+{
+	track_waittime1 = !track_waittime1;
+    start_track1 = ktime_get_ns();
+    /*if (track_waittime1) {
+        cur_index = 0;
+    } else {
+        cur_index = -1;
+    }*/
+
+    printk(KERN_ERR "Changing track_waittime1 time to %d from %d\n", track_waittime1, !track_waittime1);
+
+	return 0;
+}
+
+SYSCALL_DEFINE0(print_wait_time1)
+{
+	struct futex_table_waittime_tracking *waittime_info;
+	int bucket;
+	int i = 0;
+
+	hash_for_each(futex_table_waittime_hashtable, bucket, waittime_info, hash) {
+		printk("Futex table wait-time User %d, Wait-time %llu\n", waittime_info->uid, atomic64_read(&waittime_info->total_waittime));
+        for (i = 0; i < 1000; i++) {
+            printk(KERN_ERR "Futex [%d] LHT = %llu, Wait-time = %llu\n", i, waittime_info->lock_hold_time[i], waittime_info->wait_time[i]);
+        }
+
+	}
+
+	return 0;
+}
+
+SYSCALL_DEFINE0(clear_wait_time1)
+{
+	struct futex_table_waittime_tracking *waittime_info;
+	int bucket;
+
+	hash_for_each(futex_table_waittime_hashtable, bucket, waittime_info, hash) {
+		hash_del(&waittime_info->hash);
+		//waittime_info->total_waittime = 0;
+		//printk("Inode cache wait-time User %d, Wait-time %llu\n", waittime_info->uid, waittime_info->total_waittime);
+	}
+
+	return 0;
+}
+
+
 
 #ifdef CONFIG_HAVE_FUTEX_CMPXCHG
 #define futex_cmpxchg_enabled 1
@@ -1731,6 +1836,13 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	struct plist_head *head;
 	DEFINE_WAKE_Q(wake_q);
 	unsigned int uid = __kuid_val(current_uid());
+	s64 start = 0, end = 0, end1 = 0;
+	struct futex_table_waittime_tracking *waittime_info;
+	unsigned int index = 0;
+
+	/*unsigned long long start = 0, end = 0;
+	unsigned int measure_time = 0;
+	unsigned int count = 0;*/
 
 	if (!bitset)
 		return -EINVAL;
@@ -1741,7 +1853,11 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 
 	hb = hash_futex(&key);
 
+	start = ktime_to_ns(ktime_get());
 	spin_lock(&hb->lock);
+	end = ktime_to_ns(ktime_get());
+	waittime_info = retrieve_or_create_waittime_info1(uid);
+	atomic64_add(end - start, &waittime_info->total_waittime);
 
 	hash_val = get_futex_hash_val(&key);
 	if (bucket_under_attack[hash_val] == uid) {
@@ -1752,6 +1868,14 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 
 	/* Make sure we really have tasks to wakeup */
 	if ((!shadow) && (!hb_waiters_pending(hb))) {
+		end1 = ktime_get_ns();
+		index = ((end1 - start_track1) / 1000000000);
+		if (index > waittime_info->cur_index && index < 1000) {
+			waittime_info->lock_hold_time[index] = end1 - end;
+			waittime_info->wait_time[index] = (unsigned long long)(atomic64_read(&waittime_info->total_waittime));
+			waittime_info->cur_index = index;
+			//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+		}
 		spin_unlock(&hb->lock);
 		goto out_put_key;
 	} else if ((shadow) && (!hb_s_waiters_pending(hb))) {
@@ -1792,11 +1916,27 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 		//count++;
 	}
 
+	/*if (measure_time) {
+		end = ktime_get_ns();
+	}*/	
+
 	if (!shadow) {
+		end1 = ktime_get_ns();
+		index = ((end1 - start_track1) / 1000000000);
+		if (index > waittime_info->cur_index && index < 1000) {
+			waittime_info->lock_hold_time[index] = end1 - end;
+			waittime_info->wait_time[index] = (unsigned long long)(atomic64_read(&waittime_info->total_waittime));
+			waittime_info->cur_index = index;
+			//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+		}
 		spin_unlock(&hb->lock);
 	} else {
 		spin_unlock(&hb->s_lock);
 	}
+
+	/*if (measure_time) {
+		printk(KERN_ERR "Futex_wake time = %llu ns Count = %u\n", end - start, count);
+	}*/
 
 	wake_up_q(&wake_q);
 out_put_key:
@@ -2404,6 +2544,9 @@ static inline struct futex_hash_bucket *queue_lock(struct futex_q *q, s64 *start
 	__acquires(&hb->lock)
 {
 	struct futex_hash_bucket *hb;
+	unsigned int uid = __kuid_val(current_uid());
+	//s64 start = 0, end = 0;
+	struct futex_table_waittime_tracking *waittime_info;
 
 	hb = hash_futex(&q->key);
 
@@ -2419,7 +2562,11 @@ static inline struct futex_hash_bucket *queue_lock(struct futex_q *q, s64 *start
 
 	q->lock_ptr = &hb->lock;
 
+	*start = ktime_to_ns(ktime_get());
 	spin_lock(&hb->lock);
+	*end = ktime_to_ns(ktime_get());
+	waittime_info = retrieve_or_create_waittime_info1(uid);
+	atomic64_add(end - start, &waittime_info->total_waittime);
 
 	return hb;
 }
@@ -2428,6 +2575,19 @@ static inline void
 queue_unlock(struct futex_hash_bucket *hb, s64 *start, s64 *end)
 	__releases(&hb->lock)
 {
+	s64 end1 = 0;
+	unsigned int index = 0;
+	unsigned int uid = __kuid_val(current_uid());
+	struct futex_table_waittime_tracking *waittime_info = retrieve_or_create_waittime_info1(uid);
+
+	end1 = ktime_get_ns();
+	index = ((end1 - start_track1) / 1000000000);
+	if (index > waittime_info->cur_index && index < 1000) {
+		waittime_info->lock_hold_time[index] = end1 - *end;
+		waittime_info->wait_time[index] = (unsigned long long)(atomic64_read(&waittime_info->total_waittime));
+		waittime_info->cur_index = index;
+		//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - *end, *end - *start);
+	}
 	spin_unlock(&hb->lock);
 	hb_waiters_dec(hb);
 }
@@ -4289,7 +4449,6 @@ static void __init futex_detect_cmpxchg(void)
 #define NORMAL_PROBING_MAXTIME 20000
 
 #define SPINLOCK_WAITTIME_RANGE 100 * 1000 /* 100us */
-#define MAX_SPINLOCK_WAITTIME_RANGE 2 * 1000 * 1000 /* 100us */
 
 #define ONE_SECOND 1000 * 1000 * 1000
 
@@ -4309,19 +4468,13 @@ static unsigned int probe_futex_hash_lock(unsigned int *bucket_lock_probe_counte
 		bucket_lock_probe_counter[i] = 0;
 	}
 
-    	while (ktime_get_ns() <= end_sec) {
+    while (ktime_get_ns() <= end_sec) {
 		for (i = 0; i < futex_hashsize; i++) {
 			if (hb_waiters_pending(&futex_queues[i])) {
 				start = ktime_get_ns();
 				spin_lock(&futex_queues[i].lock);
 				end = ktime_get_ns();
 				spin_unlock(&futex_queues[i].lock);
-				
-				// Check for hard limit and flag an attack.
-				if (((end - start) > MAX_SPINLOCK_WAITTIME_RANGE)) {
-					return 1;
-				}
-
 				if (((end - start) > SPINLOCK_WAITTIME_RANGE)) {
 					bucket_lock_probe_counter[i]++;
 					count++;
@@ -4346,6 +4499,13 @@ static unsigned int probe_futex_hash_lock(unsigned int *bucket_lock_probe_counte
 			usleep_range(NORMAL_PROBING_MINTIME, NORMAL_PROBING_MAXTIME);
 		}
 	}
+
+	//printk(KERN_ERR "task_struct_cachep: Total high lock wait-times while probing locks = %d\n", count);
+	/*for (i = 0; i < futex_hashsize; i++) {
+		if (bucket_lock_probe_counter[i] || hb_waiters_pending(&futex_queues[i])) {
+			printk(KERN_ERR "Futex bucket %u - High Wait time Count = %u, Waiters = %d \n", i, bucket_lock_probe_counter[i], hb_waiters_pending(&futex_queues[i]));
+		}
+	}*/
 
 	return 0;
 }
@@ -4410,10 +4570,10 @@ int futex_cache_memory_analysis(void *arg)
 	unsigned int allocation_ratio = 0;
 	s64 local_time = 0, slow_down;
 	struct kmem_cache_memory_tracking *uid_info;
-	//unsigned long long timer_base = 0, timer_end = 0;
-	//int max_entry_index = 0, max_entries = 0;
+	unsigned long long timer_base = 0, timer_end = 0;
+	int max_entry_index = 0, max_entries = 0;
 
-	//timer_base = ktime_get_ns();
+	timer_base = ktime_get_ns();
 
 	bucket_lock_probe_counter = kcalloc(futex_hashsize, sizeof(unsigned int), GFP_KERNEL);
 
@@ -4450,11 +4610,7 @@ start:	under_attack = probe_futex_hash_lock(bucket_lock_probe_counter);
 		}
 	}
 
-	//timer_end = ktime_get_ns();
-
-	// Just print information every 10 seconds or so.
-
-	/*
+	timer_end = ktime_get_ns();
 	if ((timer_end - timer_base) > 10000000000) {
 		timer_base = timer_end;
 
@@ -4479,7 +4635,7 @@ start:	under_attack = probe_futex_hash_lock(bucket_lock_probe_counter);
 			printk(KERN_ERR "Timer:task_struct_cachep: %u user has %u entries out of %u total entries in bucket %u.\n", values[j].uid, uid_entries, entries, max_entry_index);
 
 		}
-	}*/
+	}
 
 	for (i = 0; i < futex_hashsize; i++) {
 		spin_lock(&futex_queues[i].s_lock);
@@ -4547,6 +4703,8 @@ static int __init futex_init(void)
 
 		bucket_under_attack[i] = SPECIAL_UID;
 	}
+
+	default_track_info1.cur_index = -1;
 
 	return 0;
 }

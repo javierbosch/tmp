@@ -110,6 +110,8 @@ struct kmem_cache_sorted_memory_count {
 	int uid;
 };
 
+extern s64 tracker_pw_sleep_time;
+extern int tracker_dw_time;
 extern atomic_t inode_cache_attacker;
 
 /* Sort descending order. Change the return value if ascending order needed.*/ 
@@ -125,6 +127,8 @@ struct kmem_cache {
 	DECLARE_HASHTABLE(mem_alloc_uid_hashtable1, 5);
 	spinlock_t mem_alloc_uid_lock;
 	atomic_t current_attacker;
+	//unsigned long long mem_count_avg;
+	//unsigned long long mem_count_std;
 	struct task_struct *memory_tracker_thread;
 	int (*internal_memory_analyzer)(void *);
 

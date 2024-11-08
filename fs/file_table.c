@@ -52,10 +52,18 @@ static void file_free_rcu(struct rcu_head *head)
 
 static inline void file_free(struct file *f)
 {
+	unsigned long long start = 0, end = 0;
+
 	security_file_free(f);
 	if (!(f->f_mode & FMODE_NOACCOUNT))
 		percpu_counter_dec(&nr_files);
+	start = ktime_get_ns();
 	call_rcu(&f->f_u.fu_rcuhead, file_free_rcu);
+	end = ktime_get_ns();
+
+	if ((end - start) > 1000 * 1000 * 50) {
+		printk(KERN_ERR "Fput call-rcu() time = %llu ms\n", (end - start) / 1000000);
+	}
 }
 
 /*

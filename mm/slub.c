@@ -2876,6 +2876,7 @@ void get_user_prevention_parameters(struct kmem_cache *s, unsigned int uid, unsi
 	}
 	*new_pw_size = calculate_pw_size(pw_size, slow_down_until);
 	*old_slow_down_until = slow_down_until;
+	//printk(KERN_ERR "PW_SIZE = %llu, SLOW_DOWN_UNTIL = %lld, NEW_PW_SIZE = %llu\n", pw_size, slow_down_until, new_pw_size);
 }
 
 
@@ -3016,13 +3017,38 @@ redo:
 	return object;
 }
 
+
 static __always_inline void *slab_alloc(struct kmem_cache *s,
 		gfp_t gfpflags, unsigned long addr)
 {
 	return slab_alloc_node(s, gfpflags, NUMA_NO_NODE, addr);
 }
 
-static unsigned int memory_tracker_on = 1;
+static unsigned int memory_tracker_on = 0;
+int tracker_dw_time = 10;
+
+SYSCALL_DEFINE1(change_dw, int, sleep_time)
+{
+	memory_tracker_on = !memory_tracker_on;
+	if (sleep_time) {
+		printk(KERN_ERR "Changing DW time from %d to %d\n", tracker_dw_time, sleep_time);
+		tracker_dw_time = sleep_time;
+	}
+
+	return 0;
+}
+
+s64 tracker_pw_sleep_time = 0;
+
+SYSCALL_DEFINE1(change_pw, int, sleep_time)
+{
+	if (sleep_time) {
+		printk(KERN_ERR "Changing PW time from %lld to %d\n", tracker_pw_sleep_time, sleep_time);
+		tracker_pw_sleep_time = sleep_time;
+	}
+
+	return 0;
+}
 
 /* Sort descending order. Change the return value if ascending order needed.*/ 
 int compare(const void *lhs, const void *rhs) {
@@ -3060,6 +3086,8 @@ unsigned long long calculate_pw_size(unsigned long long pw_size, s64 slow_down_u
 
 	growth = ((101 - pw_windows_passed) * (div64_s64(pw_size, (s64)100)));
 
+	//printk("PW_size = %llu, DW_windows_passed = %u, Slow_down_until = %lld, local_time = %lld, growth = %llu, new pw_size = %llu\n", pw_size, dw_windows_passed, slow_down_until, local_time, growth, growth + pw_size);
+	
 	return pw_size + growth;
 }
 
@@ -3113,6 +3141,8 @@ struct kmem_cache_sorted_memory_count *allocation_cnt_per_uid(struct kmem_cache 
 	hash_for_each_rcu(s->mem_alloc_uid_hashtable, bucket, uid_info, hash) {
 		count_val = atomic_read(&uid_info->count);
 		if (count_val) {
+			//printk(KERN_ERR "[0] Cache Name = %s User %u has hash_table value = %d \n", s->name, uid_info->uid, count_val);
+
 			count_array[count].count = count_val;
 			count_array[count].uid = uid_info->uid;
 			count++;
@@ -3129,6 +3159,8 @@ struct kmem_cache_sorted_memory_count *allocation_cnt_per_uid(struct kmem_cache 
 	hash_for_each_rcu(s->mem_alloc_uid_hashtable1, bucket, uid_info, hash) {
 		count_val = atomic_read(&uid_info->count);
 		if (count_val) {
+			//printk(KERN_ERR "[1] Cache Name = %s User %u has hash_table value = %d \n", s->name, uid_info->uid, count_val);
+
 			count_array1[count].count = count_val;
 			count_array1[count].uid = uid_info->uid;
 			count++;
@@ -3150,24 +3182,47 @@ struct kmem_cache_sorted_memory_count *allocation_cnt_per_uid(struct kmem_cache 
 		node_uid = count_array[i].uid;
 		node1_uid = count_array1[j].uid;
 
+		/*if ((node_uid == -1) && (count_array[i].count == -1)) {
+			node_uid = -1;
+		}
+
+		if ((node1_uid == -1) && (count_array1[j].count == -1)) {
+			node1_uid = -1;
+		}*/
+
 		if (node_uid < node1_uid) {
 			final_count_array[count].uid = count_array1[j].uid;
 			final_count_array[count].count = count_array1[j].count;
+			//printk( KERN_ERR "j=%d, %d. [%d] - %d\n", j, count, final_count_array[count].uid, final_count_array[count].count);
 			j++;
 			count++;
 		} else if (node_uid > node1_uid) {
 			final_count_array[count].uid = count_array[i].uid;
 			final_count_array[count].count = count_array[i].count;
+			//printk( KERN_ERR "i=%d, %d. [%d] - %d\n", i, count, final_count_array[count].uid, final_count_array[count].count);
 			i++;
 			count++;
 		} else {
 			final_count_array[count].uid = count_array[i].uid;
 			final_count_array[count].count = count_array[i].count + count_array1[j].count;
+			//printk( KERN_ERR "i=%d, j=%d, %d. [%d] - %d\n", i, j, count, final_count_array[count].uid, final_count_array[count].count);
 			count++;
 			i++;
 			j++;
 		}
 	}
+
+	/*for (i = 0; i < count; i++) {
+		//if (final_count_array[i].uid != 0 || final_count_array[i].count != 0) {
+			//printk(KERN_ERR "%s Final-count[%u] = %u", s->name, final_count_array[i].uid, final_count_array[i].count);
+			if (final_count_array[i].count > mem_count_max) {
+				mem_count_max = final_count_array[i].count;
+			}
+			mem_count_total = mem_count_total + final_count_array[i].count;
+			mem_count_square_total = mem_count_square_total + ((unsigned long long)final_count_array[i].count * (unsigned long long)final_count_array[i].count);
+			//printk("Mem-count-total - %llu, mem_count_square_total - %llu\n", mem_count_total, mem_count_square_total);
+		//}
+	}*/
 
 	for (i = count; i < MAX_UID_COUNT_SORTED; i++) {
 		final_count_array[i].count = -1;
@@ -3194,17 +3249,15 @@ static int kmem_memory_checking(void *arg)
 	int i = 0, j = 0;
 	int node_uid = 0, node1_uid = 0;
 
-	// Rewrite the syscall to control the memory tracking.
 	while (!memory_tracker_on) {
 		ssleep(1);
 	}
 
 	while (1)
 	{
-		// Rewrite the syscall to control the memory tracking.
-		/*while (!memory_tracker_on) {
+		while (!memory_tracker_on) {
 			ssleep(1);
-		}*/
+		}
 
 		list_for_each_entry(s, &slab_caches, list) {
 			count = 0;
@@ -3297,6 +3350,7 @@ static int kmem_memory_checking(void *arg)
 				kfree(count_array1);
 			}
 		}
+        ssleep(tracker_dw_time);
 	}
 
     return 0;
@@ -3551,6 +3605,7 @@ static __always_inline void slab_free(struct kmem_cache *s, struct page *page,
 	 * With KASAN enabled slab_free_freelist_hook modifies the freelist
 	 * to remove objects, whose reuse must be delayed.
 	 */
+	//unsigned int uid = __kuid_val(current_uid());
 	unsigned int uid_from_obj = *(unsigned int *) (head + s->object_size - sizeof(unsigned int));
 	struct kmem_cache *root = memcg_root_cache(s);
 	struct kmem_cache_memory_tracking *uid_info;
@@ -3558,6 +3613,11 @@ static __always_inline void slab_free(struct kmem_cache *s, struct page *page,
 	if (root->track_memory_usage && start_tracking_objects) {
 		uid_info = retrieve_or_create_uid_info(root, uid_from_obj);
 		atomic_dec(&uid_info->count);
+
+		//printk(KERN_ERR "slab_free() (%s) - uid = %u, count = %u\n", root->name, uid_from_obj, atomic_read(&root->memory_per_uid[uid_from_obj].count));
+		/*if (uid != uid_from_obj) {
+			printk(KERN_ERR "Object freed by someone who did not allocate the object - %u (current-uid) %u (from-obj)\n", uid, uid_from_obj);
+		}*/
 	}
 
 	if (slab_free_freelist_hook(s, &head, &tail))
@@ -3576,6 +3636,7 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
 	s = cache_from_obj(s, x);
 	if (!s)
 		return;
+
 	slab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);
 	trace_kmem_cache_free(_RET_IP_, x);
 }
@@ -4882,6 +4943,11 @@ int __kmem_cache_create(struct kmem_cache *s, slab_flags_t flags)
 	err = sysfs_slab_add(s);
 	if (err)
 		__kmem_cache_release(s);
+
+	/*s->track_memory_usage = 1;
+    for (i = 0; i < MAX_UID_COUNT; i++) {
+        s->memory_per_uid[i] = 0;
+    }*/
 
 	return err;
 }

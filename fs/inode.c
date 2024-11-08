@@ -23,6 +23,7 @@
 #include <trace/events/writeback.h>
 #include "internal.h"
 
+//#include "/users/yuvraj/ssd/linux-5.4.62/mm/slab.h"
 #include "../mm/slab.h"
 //#include "ext4/ext4.h"
 #include <linux/timekeeping.h>
@@ -66,6 +67,109 @@ static unsigned int i_hash_shift __read_mostly;
 static struct hlist_head *inode_hashtable __read_mostly;
 static __cacheline_aligned_in_smp DEFINE_SPINLOCK(inode_hash_lock);
 static int *inode_hash_tables_entries;
+
+DECLARE_HASHTABLE(inode_cache_waittime_hashtable, 5);
+static struct inode_cache_waittime_tracking default_track_info;
+
+int track_waittime = 0;
+unsigned long long start_track = 0;
+
+struct inode_cache_waittime_tracking {
+	unsigned int uid;	
+	unsigned long long total_waittime;
+	unsigned long long lock_hold_time[1000];
+	unsigned long long wait_time[1000];
+	unsigned int cur_index;
+	struct hlist_node hash;
+};
+
+//struct inode_cache_waittime_tracking default_track_info = {.uid = {0}, .total_waittime = {0}, .hash = {NULL}};
+
+struct inode_cache_waittime_tracking *retrieve_waittime_info(unsigned int uid)
+{
+	struct inode_cache_waittime_tracking *waittime_info;
+
+	hash_for_each_possible(inode_cache_waittime_hashtable, waittime_info, hash, uid) {
+		if (waittime_info->uid == uid) {
+			return waittime_info;
+		}
+	}
+
+	return NULL;
+}
+
+static struct inode_cache_waittime_tracking *retrieve_or_create_waittime_info(unsigned int uid)
+{
+	struct inode_cache_waittime_tracking *waittime_info;
+
+	if (!track_waittime) {
+		return &default_track_info;
+	}
+
+    waittime_info = retrieve_waittime_info(uid);
+
+    if (waittime_info) {
+        return waittime_info;
+    }
+
+    waittime_info = kzalloc(sizeof(struct inode_cache_waittime_tracking), GFP_KERNEL);
+    if (!waittime_info) {
+        return NULL;
+    }
+
+    waittime_info->uid = uid;
+    INIT_HLIST_NODE(&waittime_info->hash);
+    waittime_info->total_waittime = 0;
+
+	hash_add(inode_cache_waittime_hashtable, &waittime_info->hash, uid);
+
+    return waittime_info;
+}
+
+SYSCALL_DEFINE0(wait_time_tracking)
+{
+	track_waittime = !track_waittime;
+	start_track = ktime_get_ns();
+	/*if (track_waittime) {
+		cur_index = 0;
+	} else {
+		cur_index = -1;
+	}*/
+
+    printk(KERN_ERR "Changing track_waittime time to %d from %d\n", track_waittime, !track_waittime);
+
+	return 0;
+}
+
+SYSCALL_DEFINE0(print_wait_time)
+{
+	struct inode_cache_waittime_tracking *waittime_info;
+	int bucket;
+	int i = 0;
+
+	hash_for_each(inode_cache_waittime_hashtable, bucket, waittime_info, hash) {
+		printk(KERN_ERR "Inode cache wait-time User %d, Wait-time %llu\n", waittime_info->uid, waittime_info->total_waittime);
+		for (i = 0; i < 1000; i++) {
+			printk(KERN_ERR "[%d] LHT = %llu, Wait-time = %llu\n", i, waittime_info->lock_hold_time[i], waittime_info->wait_time[i]);
+		}
+	}
+
+	return 0;
+}
+
+SYSCALL_DEFINE0(clear_wait_time)
+{
+	struct inode_cache_waittime_tracking *waittime_info;
+	int bucket;
+
+	hash_for_each(inode_cache_waittime_hashtable, bucket, waittime_info, hash) {
+		hash_del(&waittime_info->hash);
+		//waittime_info->total_waittime = 0;
+		//printk("Inode cache wait-time User %d, Wait-time %llu\n", waittime_info->uid, waittime_info->total_waittime);
+	}
+
+	return 0;
+}
 
 /*
  * Empty aops. Can be used for the cases where the user does not
@@ -503,16 +607,31 @@ void __insert_inode_hash(struct inode *inode, unsigned long hashval)
 	unsigned long h = hash(inode->i_sb, hashval);
 	struct hlist_head *b = inode_hashtable + h;
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0, end1 = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
+	unsigned int index = 0;
 
 	while (unlikely(uid == atomic_read(&inode_cache_attacker))) {
 		printk(KERN_ERR "User %u not allowed to acquire lock\n", uid);
 		ssleep(1);
 	}
 
+	start = ktime_get_ns();
 	spin_lock(&inode_hash_lock);
+	end = ktime_get_ns();
+	waittime_info = retrieve_or_create_waittime_info(uid);
+	waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 	spin_lock(&inode->i_lock);
 	hlist_add_head(&inode->i_hash, b);
 	spin_unlock(&inode->i_lock);
+	end1 = ktime_get_ns();
+	index = ((end1 - start_track) / 1000000000);
+	if (index > waittime_info->cur_index && index < 1000) {
+		waittime_info->lock_hold_time[index] = end1 - end;
+		waittime_info->wait_time[index] = waittime_info->total_waittime;
+		waittime_info->cur_index = index;
+		//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+	}
 	inode_hash_tables_entries[h]++;
 	spin_unlock(&inode_hash_lock);
 }
@@ -528,17 +647,32 @@ void __remove_inode_hash(struct inode *inode)
 {
 	unsigned long h = hash(inode->i_sb, inode->i_ino);
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0, end1 = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
+	unsigned int index = 0;
 
 	while (unlikely(uid == atomic_read(&inode_cache_attacker))) {
 		printk(KERN_ERR "User %u not allowed to acquire lock\n", uid);
 		ssleep(1);
 	}
 
+	start = ktime_get_ns();
 	spin_lock(&inode_hash_lock);
+	end = ktime_get_ns();
+	waittime_info = retrieve_or_create_waittime_info(uid);
+	waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 	spin_lock(&inode->i_lock);
 	hlist_del_init(&inode->i_hash);
 	//WARN_ON(inode->i_ino == 0);
 	spin_unlock(&inode->i_lock);
+	end1 = ktime_get_ns();
+	index = ((end1 - start_track) / 1000000000);
+	if (index > waittime_info->cur_index && index < 1000) {
+		waittime_info->lock_hold_time[index] = end1 - end;
+		waittime_info->wait_time[index] = waittime_info->total_waittime;
+		waittime_info->cur_index = index;
+		//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+	}
 	inode_hash_tables_entries[h]--;
 	spin_unlock(&inode_hash_lock);
 }
@@ -1103,6 +1237,9 @@ struct inode *inode_insert5(struct inode *inode, unsigned long hashval,
 	struct inode *old;
 	bool creating = inode->i_state & I_CREATING;
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0, end1 = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
+	unsigned int index = 0;
 
 again:
 	while (unlikely(uid == atomic_read(&inode_cache_attacker))) {
@@ -1110,7 +1247,11 @@ again:
 		ssleep(1);
 	}
 
+	start = ktime_get_ns();
 	spin_lock(&inode_hash_lock);
+	end = ktime_get_ns();
+	waittime_info = retrieve_or_create_waittime_info(uid);
+	waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 	old = find_inode(inode->i_sb, head, test, data);
 	if (unlikely(old)) {
 		/*
@@ -1145,6 +1286,14 @@ again:
 	if (!creating)
 		inode_sb_list_add(inode);
 unlock:
+	end1 = ktime_get_ns();
+	index = ((end1 - start_track) / 1000000000);
+	if (index > waittime_info->cur_index && index < 1000) {
+		waittime_info->lock_hold_time[index] = end1 - end;
+		waittime_info->wait_time[index] = waittime_info->total_waittime;
+		waittime_info->cur_index = index;
+		//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+	}
 	spin_unlock(&inode_hash_lock);
 
 	return inode;
@@ -1210,13 +1359,29 @@ struct inode *iget_locked(struct super_block *sb, unsigned long ino)
 	struct hlist_head *head = inode_hashtable + h;
 	struct inode *inode;
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0, end1 = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
+	unsigned int index = 0;
+
 again:
 	while (unlikely(uid == atomic_read(&inode_cache_attacker))) {
 		printk(KERN_ERR "User %u not allowed to acquire lock\n", uid);
 		ssleep(1);
 	}
+	start = ktime_get_ns();
 	spin_lock(&inode_hash_lock);
+	end = ktime_get_ns();
+	waittime_info = retrieve_or_create_waittime_info(uid);
+	waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 	inode = find_inode_fast(sb, head, ino);
+	end1 = ktime_get_ns();
+	index = ((end1 - start_track) / 1000000000);
+	if (index > waittime_info->cur_index && index < 1000) {
+		waittime_info->lock_hold_time[index] = end1 - end;
+		waittime_info->wait_time[index] = waittime_info->total_waittime;
+		waittime_info->cur_index = index;
+		//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+	}
 	spin_unlock(&inode_hash_lock);
 	if (inode) {
 		if (IS_ERR(inode))
@@ -1237,7 +1402,11 @@ again:
 			printk(KERN_ERR "User %u not allowed to acquire lock\n", uid);
 			ssleep(1);
 		}
+		start = ktime_get_ns();
 		spin_lock(&inode_hash_lock);
+		end = ktime_get_ns();
+		waittime_info = retrieve_or_create_waittime_info(uid);
+		waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 		/* We released the lock, so.. */
 		old = find_inode_fast(sb, head, ino);
 		if (!old) {
@@ -1248,6 +1417,14 @@ again:
 			spin_unlock(&inode->i_lock);
 			inode_hash_tables_entries[h]++;
 			inode_sb_list_add(inode);
+			end1 = ktime_get_ns();
+			index = ((end1 - start_track) / 1000000000);
+			if (index > waittime_info->cur_index && index < 1000) {
+				waittime_info->lock_hold_time[index] = end1 - end;
+				waittime_info->wait_time[index] = waittime_info->total_waittime;
+				waittime_info->cur_index = index;
+				//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+			}
 			spin_unlock(&inode_hash_lock);
 
 			/* Return the locked inode with I_NEW set, the
@@ -1261,6 +1438,14 @@ again:
 		 * us. Use the old inode instead of the one we just
 		 * allocated.
 		 */
+		end1 = ktime_get_ns();
+		index = ((end1 - start_track) / 1000000000);
+		if (index > waittime_info->cur_index && index < 1000) {
+			waittime_info->lock_hold_time[index] = end1 - end;
+			waittime_info->wait_time[index] = waittime_info->total_waittime;
+			waittime_info->cur_index = index;
+			//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+		}
 		spin_unlock(&inode_hash_lock);
 		destroy_inode(inode);
 		if (IS_ERR(old))
@@ -1288,17 +1473,32 @@ static int test_inode_iunique(struct super_block *sb, unsigned long ino)
 	struct hlist_head *b = inode_hashtable + hash(sb, ino);
 	struct inode *inode;
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0, end1 = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
+	unsigned int index = 0;
 
 	while (unlikely(uid == atomic_read(&inode_cache_attacker))) {
 		printk(KERN_ERR "User %u not allowed to acquire lock\n", uid);
 		ssleep(1);
 	}
+	start = ktime_get_ns();
 	spin_lock(&inode_hash_lock);
+	end = ktime_get_ns();
+	waittime_info = retrieve_or_create_waittime_info(uid);
+	waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 	hlist_for_each_entry(inode, b, i_hash) {
 		if (inode->i_ino == ino && inode->i_sb == sb) {
 			spin_unlock(&inode_hash_lock);
 			return 0;
 		}
+	}
+	end1 = ktime_get_ns();
+	index = ((end1 - start_track) / 1000000000);
+	if (index > waittime_info->cur_index && index < 1000) {
+		waittime_info->lock_hold_time[index] = end1 - end;
+		waittime_info->wait_time[index] = waittime_info->total_waittime;
+		waittime_info->cur_index = index;
+		//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
 	}
 	spin_unlock(&inode_hash_lock);
 
@@ -1383,13 +1583,28 @@ struct inode *ilookup5_nowait(struct super_block *sb, unsigned long hashval,
 	struct hlist_head *head = inode_hashtable + hash(sb, hashval);
 	struct inode *inode;
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0, end1 = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
+	unsigned int index = 0;
 
 	while (unlikely(uid == atomic_read(&inode_cache_attacker))) {
 		printk(KERN_ERR  "User %u not allowed to acquire lock\n", uid);
 		ssleep(1);
 	}
+	start = ktime_get_ns();
 	spin_lock(&inode_hash_lock);
+	end = ktime_get_ns();
+	waittime_info = retrieve_or_create_waittime_info(uid);
+	waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 	inode = find_inode(sb, head, test, data);
+	end1 = ktime_get_ns();
+	index = ((end1 - start_track) / 1000000000);
+	if (index > waittime_info->cur_index && index < 1000) {
+		waittime_info->lock_hold_time[index] = end1 - end;
+		waittime_info->wait_time[index] = waittime_info->total_waittime;
+		waittime_info->cur_index = index;
+		//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+	}
 	spin_unlock(&inode_hash_lock);
 
 	return IS_ERR(inode) ? NULL : inode;
@@ -1443,13 +1658,29 @@ struct inode *ilookup(struct super_block *sb, unsigned long ino)
 	struct hlist_head *head = inode_hashtable + hash(sb, ino);
 	struct inode *inode;
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0, end1 = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
+	unsigned int index = 0;
+
 again:
 	while (unlikely(uid == atomic_read(&inode_cache_attacker))) {
 		printk(KERN_ERR "User %u not allowed to acquire lock\n", uid);
 		ssleep(1);
 	}
+	start = ktime_get_ns();
 	spin_lock(&inode_hash_lock);
+	end = ktime_get_ns();
+	waittime_info = retrieve_or_create_waittime_info(uid);
+	waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 	inode = find_inode_fast(sb, head, ino);
+	end1 = ktime_get_ns();
+	index = ((end1 - start_track) / 1000000000);
+	if (index > waittime_info->cur_index && index < 1000) {
+		waittime_info->lock_hold_time[index] = end1 - end;
+		waittime_info->wait_time[index] = waittime_info->total_waittime;
+		waittime_info->cur_index = index;
+		//printk("KERN_ERR [%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+	}
 	spin_unlock(&inode_hash_lock);
 
 	if (inode) {
@@ -1498,12 +1729,19 @@ struct inode *find_inode_nowait(struct super_block *sb,
 	struct inode *inode, *ret_inode = NULL;
 	int mval;
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0, end1 = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
+	unsigned int index = 0;
 
 	while (unlikely(uid == atomic_read(&inode_cache_attacker))) {
 		printk(KERN_ERR "User %u not allowed to acquire lock\n", uid);
 		ssleep(1);
 	}
+	start = ktime_get_ns();
 	spin_lock(&inode_hash_lock);
+	end = ktime_get_ns();
+	waittime_info = retrieve_or_create_waittime_info(uid);
+	waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 	hlist_for_each_entry(inode, head, i_hash) {
 		if (inode->i_sb != sb)
 			continue;
@@ -1515,6 +1753,14 @@ struct inode *find_inode_nowait(struct super_block *sb,
 		goto out;
 	}
 out:
+	end1 = ktime_get_ns();
+	index = ((end1 - start_track) / 1000000000);
+	if (index > waittime_info->cur_index && index < 1000) {
+		waittime_info->lock_hold_time[index] = end1 - end;
+		waittime_info->wait_time[index] = waittime_info->total_waittime;
+		waittime_info->cur_index = index;
+		//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+	}
 	spin_unlock(&inode_hash_lock);
 	return ret_inode;
 }
@@ -1527,6 +1773,9 @@ int insert_inode_locked(struct inode *inode)
 	unsigned long h = hash(sb, ino);
 	struct hlist_head *head = inode_hashtable + h;
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0, end1 = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
+	unsigned int index = 0;
 
 	while (1) {
 		struct inode *old = NULL;
@@ -1534,7 +1783,11 @@ int insert_inode_locked(struct inode *inode)
 			printk(KERN_ERR  "User %u not allowed to acquire lock\n", uid);
 			ssleep(1);
 		}
+		start = ktime_get_ns();
 		spin_lock(&inode_hash_lock);
+		end = ktime_get_ns();
+		waittime_info = retrieve_or_create_waittime_info(uid);
+		waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 		hlist_for_each_entry(old, head, i_hash) {
 			if (old->i_ino != ino)
 				continue;
@@ -1553,16 +1806,40 @@ int insert_inode_locked(struct inode *inode)
 			hlist_add_head(&inode->i_hash, head);
 			spin_unlock(&inode->i_lock);
 			inode_hash_tables_entries[h]++;
+			end1 = ktime_get_ns();
+			index = ((end1 - start_track) / 1000000000);
+			if (index > waittime_info->cur_index && index < 1000) {
+				waittime_info->lock_hold_time[index] = end1 - end;
+				waittime_info->wait_time[index] = waittime_info->total_waittime;
+				waittime_info->cur_index = index;
+				//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+			}
 			spin_unlock(&inode_hash_lock);
 			return 0;
 		}
 		if (unlikely(old->i_state & I_CREATING)) {
 			spin_unlock(&old->i_lock);
+			end1 = ktime_get_ns();
+			index = ((end1 - start_track) / 1000000000);
+			if (index > waittime_info->cur_index && index < 1000) {
+				waittime_info->lock_hold_time[index] = end1 - end;
+				waittime_info->wait_time[index] = waittime_info->total_waittime;
+				waittime_info->cur_index = index;
+				//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+			}
 			spin_unlock(&inode_hash_lock);
 			return -EBUSY;
 		}
 		__iget(old);
 		spin_unlock(&old->i_lock);
+		end1 = ktime_get_ns();
+		index = ((end1 - start_track) / 1000000000);
+		if (index > waittime_info->cur_index && index < 1000) {
+			waittime_info->lock_hold_time[index] = end1 - end;
+			waittime_info->wait_time[index] = waittime_info->total_waittime;
+			waittime_info->cur_index = index;
+			//printk(KERN_ERR "[%u] LHT = %llu, Wait-time = %llu\n", index, end1 - end, end - start);
+		}
 		spin_unlock(&inode_hash_lock);
 		wait_on_inode(old);
 		if (unlikely(!inode_unhashed(old))) {
@@ -2026,6 +2303,8 @@ EXPORT_SYMBOL(inode_needs_sync);
 static void __wait_on_freeing_inode(struct inode *inode)
 {
 	unsigned int uid = __kuid_val(current_uid());
+	unsigned long long start = 0, end = 0;
+	struct inode_cache_waittime_tracking *waittime_info;
 
 	wait_queue_head_t *wq;
 	DEFINE_WAIT_BIT(wait, &inode->i_state, __I_NEW);
@@ -2040,7 +2319,11 @@ static void __wait_on_freeing_inode(struct inode *inode)
 		printk(KERN_ERR "User %u not allowed to acquire lock\n", uid);
 		ssleep(1);
 	}
+	start = ktime_get_ns();
 	spin_lock(&inode_hash_lock);
+	end = ktime_get_ns();
+	waittime_info = retrieve_or_create_waittime_info(uid);
+	waittime_info->total_waittime = waittime_info->total_waittime + (end - start);
 }
 
 static __initdata unsigned long ihash_entries;
@@ -2087,6 +2370,8 @@ void __init inode_init_early(void)
 					&h_hash_mask,
 					0,
 					0);
+
+	hash_init(inode_cache_waittime_hashtable);
 }
 
 unsigned int evict_inodes_by_uid(struct super_block *sb, unsigned int uid, unsigned int (*f)(struct inode *))
@@ -2097,6 +2382,7 @@ unsigned int evict_inodes_by_uid(struct super_block *sb, unsigned int uid, unsig
 	//struct ext4_inode_info *ei;
 	unsigned int inodes_evicted = 0;
 
+	printk(KERN_ERR "(%s): Evicting inodes now...\n", sb->s_id);
 again:
 	spin_lock(&sb->s_inode_list_lock);
 	list_for_each_entry_safe(inode, next, &sb->s_inodes, i_sb_list) {
@@ -2104,6 +2390,9 @@ again:
 			continue;
 
 		inode_uid = f(inode);
+		//ei = EXT4_I(inode);
+		//inode_uid = *(unsigned int *) ((void *)ei + sizeof(struct ext4_inode_info));
+		//printk(KERN_ERR "EVICT (0x%px) (0x%px) inode-uid - %u passed-uid - %u\n", ei, (void *) (ei) + 2320, inode_uid, uid);
 		if (inode_uid != uid)
 			continue;
 
@@ -2148,7 +2437,6 @@ EXPORT_SYMBOL_GPL(evict_inodes_by_uid);
 #define NORMAL_PROBING_MAXTIME 20000
 
 #define SPINLOCK_WAITTIME_RANGE 100 * 1000 /* 100us */
-#define MAX_SPINLOCK_WAITTIME_RANGE 2 * 1000 * 1000 /* 2ms */
 
 #define ONE_SECOND 1000 * 1000 * 1000
 
@@ -2162,7 +2450,10 @@ unsigned int probe_inode_cache_hash_lock(void)
 	unsigned int aggressive = 0;
 	
 	get_random_bytes(&r, sizeof(r));
+	//curr_time = ktime_get_ns(); //
 	end_sec = ktime_get_ns() + ONE_SECOND + (unsigned long long)r;
+	//printk(KERN_ERR "curr_time = %llu, r = %u, end_sec = %llu, diff = %llu\n", curr_time, r, end_sec, (end_sec - curr_time)/ 1000000000); //
+	//end_sec = ktime_get_ns() + (ONE_SECOND * ((r & 3) + 1));
 
 	while (ktime_get_ns() <= end_sec) {
 		start = ktime_get_ns();
@@ -2170,23 +2461,20 @@ unsigned int probe_inode_cache_hash_lock(void)
 
 		end = ktime_get_ns();
 		spin_unlock(&inode_hash_lock);
-
-		// Check for the hard limit and flag the attack.
-		if ((end - start) > MAX_SPINLOCK_WAITTIME_RANGE) {
-			return 1;
-		}
-
 		if ((end - start) > SPINLOCK_WAITTIME_RANGE) {
+			printk(KERN_ERR "Inodecache lock wait-time %llu ns\n", end - start);
 			lock_wait_time_high_count++;
 
 			if (!aggressive) {
 				get_random_bytes(&r, sizeof(r));
 				end_sec = end_sec + (ONE_SECOND * (((unsigned long long)r & 7) + 1));
+				//printk(KERN_ERR "Aggressive mode: End time increasded by %u to %llu, curr_time = %llu, end_sec = %llu\n", ((r & 7) + 1), (end_sec - curr_time)/ 1000000000, curr_time, end_sec); //
 				aggressive = 1;
 			}
 		}
 
 		if (lock_wait_time_high_count > 5) {
+			printk(KERN_ERR "lock_wait_time_high_count more than 5\n");
 			return 1;
 		}
 
@@ -2255,6 +2543,13 @@ void __init inode_init(void)
 					 SLAB_MEM_SPREAD|SLAB_ACCOUNT),
 					 init_once);
 
+	//inode_cachep->track_memory_usage = 1;
+	//inode_cachep->internal_memory_analyzer = inode_cache_memory_analysis; 
+    /*for (i = 0; i < MAX_UID_COUNT; i++) {
+        inode_cachep->memory_per_uid[i].count = 0;
+        inode_cachep->memory_per_uid[i].slow_down = 0;
+    }*/
+
 	/* Hash may have been set up in inode_init_early */
 	if (!hashdist)
 		return;
@@ -2280,6 +2575,9 @@ void __init inode_init(void)
 					&h_hash_mask,
 					0,
 					0);
+
+	hash_init(inode_cache_waittime_hashtable);
+	default_track_info.cur_index = -1;
 }
 
 void init_special_inode(struct inode *inode, umode_t mode, dev_t rdev)

@@ -24,6 +24,7 @@
 #include <linux/posix_acl.h>
 #include <linux/pid_namespace.h>
 
+//#include "/users/yuvraj/ssd/linux-5.4.62/mm/slab.h"
 #include "../mm/slab.h"
 #include <linux/sort.h>
 
@@ -1441,9 +1442,9 @@ int fuse_inode_cache_memory_analysis(void *arg)
 	struct kmem_cache_memory_tracking *uid_info;
 	int numa_node_id = 0;
 	unsigned long long new_pw_size = 0;
-	//unsigned long long timer_base = 0, timer_end = 0;
+	unsigned long long timer_base = 0, timer_end = 0;
 
-	//timer_base = ktime_get_ns();
+	timer_base = ktime_get_ns();
 
 start:	under_attack = probe_inode_cache_hash_lock();
 
@@ -1489,10 +1490,7 @@ start:	under_attack = probe_inode_cache_hash_lock();
 		}
 	}
 
-	//timer_end = ktime_get_ns();
-
-	// Just print the information every 10 seconds or so. 
-	/*
+	timer_end = ktime_get_ns();
 	if ((timer_end - timer_base) > 10000000000) {
 		timer_base = timer_end;
 	
@@ -1510,7 +1508,7 @@ start:	under_attack = probe_inode_cache_hash_lock();
 			uid_entries = walk_single_hash_bucket_for_uid(values[i].uid, bucket_index, fuse_uid_from_vfs_inode);
 			printk(KERN_ERR "Timer:fuse_inode_cachep: %u user has %u entries out of %u total entries in bucket %u\n", values[i].uid, uid_entries, entries, bucket_index);
 		}
-	}*/
+	}
 
 	goto start;
 

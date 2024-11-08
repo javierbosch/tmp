@@ -55,6 +55,7 @@
 #include "mballoc.h"
 #include "fsmap.h"
 
+//#include "/users/yuvraj/ssd/linux-5.4.62/mm/slab.h"
 #include "../mm/slab.h"
 #include <linux/sort.h>
 #include <linux/delay.h>
@@ -1086,6 +1087,7 @@ static struct inode *ext4_alloc_inode(struct super_block *sb)
 	struct ext4_inode_info *ei;
 
 	ei = kmem_cache_alloc(ext4_inode_cachep, GFP_NOFS);
+
 	if (!ei)
 		return NULL;
 
@@ -1176,6 +1178,7 @@ static void check_ext4_fs(struct super_block *sb, void *arg)
 	if (strncmp(sb->s_type->name, fs_name, strlen(fs_name)) == 0) {
 		recover_dcache_sb(sb);
 		inodes_evicted = evict_inodes_by_uid(sb, attacker_uid_ext4, ext4_uid_from_vfs_inode);
+		printk(KERN_ERR "ext4_inode_cachep: (%s) Total inodes %u evicted belonging to %u user as part of the recovery.\n", sb->s_id, inodes_evicted, attacker_uid_ext4);
 	}
 }
 
@@ -1200,9 +1203,9 @@ int ext4_inode_cache_memory_analysis(void *arg)
 	struct kmem_cache_memory_tracking *uid_info;
 	int numa_node_id = 0;
 	unsigned long long new_pw_size = 0;
-	//unsigned long long timer_base = 0, timer_end = 0;
+	unsigned long long timer_base = 0, timer_end = 0;
 
-	//timer_base = ktime_get_ns();
+	timer_base = ktime_get_ns();
 
 start:	under_attack = probe_inode_cache_hash_lock();
 
@@ -1213,17 +1216,6 @@ start:	under_attack = probe_inode_cache_hash_lock();
 		bucket_index = get_top_used_hash_bucket(&entries);
 		printk(KERN_ERR "(ext4_inode_cachep)Max index is %u having %u entries\n", bucket_index, entries);
 
-		/* There is a potential race where the ext4 and fuse kernel
-		 * thread when they both identify that under_attack is true. If
-		 * fuse first cleans up the attacked bucket, for the ext4
-		 * thread, get_top_used_hash_bucket() can return some very
-		 * small bucket as a potential target hash bucket leading to
-		 * falsely flagging a victim as an attacker. Current fix below
-		 * if just a TEMPORARY BANDAGE. 
-		 * The real fix can be to sequentially perform the analysis; or 
-		 * ensure that get_top_used_hash_bucket() returns the same hash
-		 * bucket. 
-		 */
 		if (entries < BUCKET_ENTRY_THRESHOLD) {
 			printk(KERN_ERR "ext4_inode_cachep Skipping...\n");
 			goto start;
@@ -1263,10 +1255,8 @@ start:	under_attack = probe_inode_cache_hash_lock();
 		}
 	}
 
-	//timer_end = ktime_get_ns();
-
-	// Just print data every 10 seconds or so.
-	/*if ((timer_end - timer_base) > 10000000000) {
+	timer_end = ktime_get_ns();
+	if ((timer_end - timer_base) > 10000000000) {
 		timer_base = timer_end;
 	
 		values = allocation_cnt_per_uid(ext4_inode_cachep);
@@ -1283,7 +1273,7 @@ start:	under_attack = probe_inode_cache_hash_lock();
 			uid_entries = walk_single_hash_bucket_for_uid(values[i].uid, bucket_index, ext4_uid_from_vfs_inode);
 			printk(KERN_ERR "Timer:ext4_inode_cachep: %u user has %u entries out of %u total entries in bucket %u\n", values[i].uid, uid_entries, entries, bucket_index);
 		}
-	}*/
+	}
 
 	goto start;
 
